@@ -77,18 +77,6 @@ function detectColumn(headers, patterns) {
   return null;
 }
 
-function detectColumn(headers, patterns) {
-  const normalized = headers.map(h => ({
-    original: h,
-    key: String(h).toLowerCase().replace(/[\s_-]+/g, "")
-  }));
-  for (const pattern of patterns) {
-    const match = normalized.find(x => pattern.includes(x.key));
-    if (match) return match.original;
-  }
-  return null;
-}
-
 function numericValue(value) {
   if (value === null || value === undefined || value === "") return 0;
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
