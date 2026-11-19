@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
+import RETAILROCKET from "./retailrocket-insights.json";
 import {
   Activity, AlertCircle, ArrowDownRight, ArrowUpRight, BarChart3,
+  Hourglass, LogIn, MousePointerClick, Info, CircleAlert,
   BookOpen, Bot, Check, ChevronDown, CircleHelp, Clock3, Database,
   Download, Eye, FileText, FileUp, Github, LayoutDashboard, Menu,
   MessageSquare, Plus, Search, Send, ShoppingBag, ShoppingCart,
@@ -75,6 +77,49 @@ function detectColumn(headers, patterns) {
   return null;
 }
 
+function detectColumn(headers, patterns) {
+  const normalized = headers.map(h => ({
+    original: h,
+    key: String(h).toLowerCase().replace(/[\s_-]+/g, "")
+  }));
+  for (const pattern of patterns) {
+    const match = normalized.find(x => pattern.includes(x.key));
+    if (match) return match.original;
+  }
+  return null;
+}
+
+function numericValue(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const parsed = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseEventDate(value) {
+  if (value === null || value === undefined || value === "") return null;
+  let date;
+  if (typeof value === "number" || /^\d{10,13}$/.test(String(value))) {
+    const n = Number(value);
+    date = new Date(n > 1e12 ? n : n > 1e9 ? n * 1000 : NaN);
+  } else {
+    date = new Date(value);
+  }
+  return Number.isFinite(date?.getTime?.()) ? date : null;
+}
+
+function classifyEvent(value) {
+  const event = String(value ?? "").toLowerCase().trim();
+  if (/impression|impress/.test(event)) return "impression";
+  if (/click/.test(event)) return "click";
+  if (/login|log_in|sign.?in|authenticate/.test(event)) return "login";
+  if (/logout|log_out|sign.?out/.test(event)) return "logout";
+  if (/cart|basket/.test(event)) return "cart";
+  if (/transaction|purchase|order|checkout|complete|paid/.test(event)) return "transaction";
+  if (/view|product.?page|page.?view/.test(event)) return "view";
+  return "other";
+}
+
 function normalizeRows(rawRows) {
   if (!rawRows.length) return { rows: [], schema: {}, headers: [] };
   const headers = Object.keys(rawRows[0] || {});
@@ -84,94 +129,349 @@ function normalizeRows(rawRows) {
     product: detectColumn(headers, ["itemid", "productid", "sku", "product", "item"]),
     timestamp: detectColumn(headers, ["timestamp", "datetime", "date", "createdat", "eventtime", "time"]),
     transaction: detectColumn(headers, ["transactionid", "orderid", "order", "transaction"]),
-    revenue: detectColumn(headers, ["revenue", "sales", "amount", "total", "ordervalue"])
+    revenue: detectColumn(headers, ["revenue", "sales", "amount", "total", "ordervalue"]),
+    impression: detectColumn(headers, ["impressions", "impression", "impressioncount", "impressionscount"]),
+    click: detectColumn(headers, ["clicks", "click", "clickcount", "clickscount"]),
+    loginFlag: detectColumn(headers, ["isloggedin", "loggedin", "loginstatus", "authenticated"]),
+    session: detectColumn(headers, ["sessionid", "session", "sessionkey"]),
+    duration: detectColumn(headers, ["sessionduration", "durationseconds", "durationminutes", "durationms", "duration", "sessiontime"])
   };
+
   const rows = rawRows.map(raw => {
     const eventRaw = schema.event ? String(raw[schema.event] ?? "").toLowerCase() : "";
-    let event = "other";
-    if (/view|impression|product.?click/.test(eventRaw)) event = "view";
-    else if (/cart|basket/.test(eventRaw)) event = "cart";
-    else if (/transaction|purchase|order|checkout|complete|paid/.test(eventRaw)) event = "transaction";
-    const ts = schema.timestamp ? raw[schema.timestamp] : null;
-    let date = null;
-    if (ts !== null && ts !== undefined && ts !== "") {
-      if (typeof ts === "number" || (/^\d{10,13}$/.test(String(ts)))) {
-        const n = Number(ts);
-        date = new Date(n > 1e12 ? n : n > 1e9 ? n * 1000 : NaN);
-      } else {
-        date = new Date(ts);
-      }
-      if (!Number.isFinite(date?.getTime?.())) date = null;
-    }
+    const event = classifyEvent(eventRaw);
+    const timestamp = schema.timestamp ? parseEventDate(raw[schema.timestamp]) : null;
+    const loginValue = schema.loginFlag ? String(raw[schema.loginFlag] ?? "").toLowerCase() : "";
+    const isLoggedIn = ["true", "1", "yes", "y", "logged_in", "authenticated"].includes(loginValue);
     return {
       raw,
       event,
       eventRaw,
       visitor: schema.visitor ? String(raw[schema.visitor] ?? "") : "",
       product: schema.product ? String(raw[schema.product] ?? "") : "",
-      timestamp: date,
+      timestamp,
       transaction: schema.transaction ? String(raw[schema.transaction] ?? "") : "",
-      revenue: schema.revenue ? Number(raw[schema.revenue]) : null
+      revenue: schema.revenue ? numericValue(raw[schema.revenue]) : null,
+      impressionsValue: schema.impression ? numericValue(raw[schema.impression]) : 0,
+      clicksValue: schema.click ? numericValue(raw[schema.click]) : 0,
+      isLoggedIn,
+      session: schema.session ? String(raw[schema.session] ?? "") : "",
+      durationValue: schema.duration ? numericValue(raw[schema.duration]) : null
     };
   });
+
   return { rows, schema, headers };
+}
+
+function calculateSessionMetrics(rows, schema) {
+  const durationName = String(schema.duration || "").toLowerCase();
+  const durations = rows
+    .map(row => row.durationValue)
+    .filter(value => Number.isFinite(value) && value >= 0);
+
+  if (schema.duration && durations.length) {
+    let divisor = 60;
+    if (/ms|milli/.test(durationName)) divisor = 60000;
+    else if (/min/.test(durationName)) divisor = 1;
+    else if (/hour|hr/.test(durationName)) divisor = 1 / 60;
+    const minutes = durations.map(value => value / divisor).sort((a, b) => a - b);
+    const mean = minutes.reduce((sum, value) => sum + value, 0) / minutes.length;
+    return {
+      available: true,
+      method: "Explicit duration column: " + schema.duration,
+      count: schema.session ? new Set(rows.map(r => r.session).filter(Boolean)).size : minutes.length,
+      avg: mean,
+      median: minutes[Math.floor(minutes.length / 2)],
+      p90: minutes[Math.min(minutes.length - 1, Math.floor(minutes.length * 0.9))],
+      multiEventCount: null
+    };
+  }
+
+  if (schema.session && rows.some(row => row.session) && rows.some(row => row.timestamp)) {
+    const groups = new Map();
+    rows.forEach(row => {
+      if (!row.session || !row.timestamp) return;
+      const time = row.timestamp.getTime();
+      const group = groups.get(row.session) || { start: time, end: time, count: 0 };
+      group.start = Math.min(group.start, time);
+      group.end = Math.max(group.end, time);
+      group.count++;
+      groups.set(row.session, group);
+    });
+    const values = [...groups.values()].filter(group => group.count > 1).map(group => (group.end - group.start) / 60000).sort((a, b) => a - b);
+    if (!groups.size) return { available: false, method: "Session IDs found, but no usable timestamps", count: 0, avg: null, median: null, p90: null };
+    return {
+      available: true,
+      method: "Computed from the uploaded session ID and timestamp columns",
+      count: groups.size,
+      avg: values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0,
+      median: values.length ? values[Math.floor(values.length / 2)] : 0,
+      p90: values.length ? values[Math.min(values.length - 1, Math.floor(values.length * 0.9))] : 0,
+      multiEventCount: values.length
+    };
+  }
+
+  if (schema.visitor && schema.timestamp) {
+    if (rows.length > 500000) {
+      return {
+        available: false,
+        method: "Session inference skipped for files above 500,000 rows; provide a session ID or precomputed duration column",
+        count: null,
+        avg: null,
+        median: null,
+        p90: null
+      };
+    }
+
+    const ordered = rows
+      .filter(row => row.visitor && row.timestamp)
+      .map(row => ({ visitor: row.visitor, time: row.timestamp.getTime() }))
+      .sort((a, b) => a.visitor.localeCompare(b.visitor) || a.time - b.time);
+
+    let sessionCount = 0;
+    let currentVisitor = null;
+    let start = 0;
+    let last = 0;
+    let eventCount = 0;
+    let singleEventSessions = 0;
+    const durations = [];
+
+    const finish = () => {
+      if (eventCount === 0) return;
+      sessionCount++;
+      if (eventCount === 1) singleEventSessions++;
+      else durations.push((last - start) / 60000);
+    };
+
+    ordered.forEach(row => {
+      const newSession = currentVisitor !== row.visitor || row.time - last > 30 * 60 * 1000;
+      if (newSession) {
+        finish();
+        currentVisitor = row.visitor;
+        start = row.time;
+        eventCount = 1;
+      } else {
+        eventCount++;
+      }
+      last = row.time;
+    });
+    finish();
+
+    durations.sort((a, b) => a - b);
+    const mean = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : 0;
+
+    return {
+      available: true,
+      method: "Estimated by visitor ID and a 30-minute inactivity gap; not source session IDs",
+      count: sessionCount,
+      avg: mean,
+      median: durations.length ? durations[Math.floor(durations.length / 2)] : 0,
+      p90: durations.length ? durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.9))] : 0,
+      multiEventCount: durations.length,
+      singleEventSessions
+    };
+  }
+
+  return {
+    available: false,
+    method: "No usable session ID, duration, or visitor/timestamp pair was detected",
+    count: null,
+    avg: null,
+    median: null,
+    p90: null
+  };
 }
 
 function aggregate(data) {
   const rows = data.rows;
-  const count = event => rows.filter(r => r.event === event).length;
-  const views = count("view");
-  const carts = count("cart");
-  const transactions = count("transaction");
-  const visitors = new Set(rows.map(r => r.visitor).filter(Boolean)).size;
-  const products = new Set(rows.map(r => r.product).filter(Boolean)).size;
+  const counts = { view: 0, cart: 0, transaction: 0, click: 0, impression: 0, login: 0 };
+  rows.forEach(row => { if (counts[row.event] !== undefined) counts[row.event]++; });
+
+  const eventClicks = counts.click;
+  const eventImpressions = counts.impression;
+  const hasClickEvent = rows.some(row => row.event === "click");
+  const hasImpressionEvent = rows.some(row => row.event === "impression");
+  const hasLoginEvent = rows.some(row => row.event === "login");
+  const clicks = hasClickEvent ? eventClicks : rows.reduce((sum, row) => sum + row.clicksValue, 0);
+  const impressions = hasImpressionEvent ? eventImpressions : rows.reduce((sum, row) => sum + row.impressionsValue, 0);
+  const clickAvailable = (hasClickEvent && hasImpressionEvent) || Boolean(data.schema.click && data.schema.impression);
+  const loginAvailable = hasLoginEvent || Boolean(data.schema.loginFlag);
+  const logins = hasLoginEvent ? counts.login : rows.filter(row => row.isLoggedIn).length;
+  const loginVisitors = new Set(rows.filter(row => row.event === "login" || row.isLoggedIn).map(row => row.visitor).filter(Boolean)).size;
+
+  const visitors = new Set(rows.map(row => row.visitor).filter(Boolean)).size;
+  const products = new Set(rows.map(row => row.product).filter(Boolean)).size;
+
   const productMap = new Map();
-  rows.forEach(r => {
-    if (!r.product) return;
-    const item = productMap.get(r.product) || { product: r.product, views: 0, carts: 0, transactions: 0 };
-    if (r.event === "view") item.views++;
-    if (r.event === "cart") item.carts++;
-    if (r.event === "transaction") item.transactions++;
-    productMap.set(r.product, item);
+  rows.forEach(row => {
+    if (!row.product) return;
+    const item = productMap.get(row.product) || {
+      product: row.product, views: 0, carts: 0, transactions: 0, clicks: 0, impressions: 0
+    };
+    if (row.event === "view") item.views++;
+    if (row.event === "cart") item.carts++;
+    if (row.event === "transaction") item.transactions++;
+    if (row.event === "click") item.clicks++;
+    if (row.event === "impression") item.impressions++;
+    if (!hasClickEvent && data.schema.click) item.clicks += row.clicksValue;
+    if (!hasImpressionEvent && data.schema.impression) item.impressions += row.impressionsValue;
+    productMap.set(row.product, item);
   });
-  const topProducts = [...productMap.values()].sort((a, b) => b.views - a.views).slice(0, 8);
-  const topCart = [...productMap.values()].sort((a, b) => b.carts - a.carts).slice(0, 8);
+
+  const topBy = field => [...productMap.values()]
+    .sort((a, b) => b[field] - a[field])
+    .slice(0, 15);
+
   const visitorMap = new Map();
-  rows.forEach(r => {
-    if (!r.visitor) return;
-    const item = visitorMap.get(r.visitor) || { visitor: r.visitor, events: 0, views: 0, carts: 0, transactions: 0, products: new Set() };
+  rows.forEach(row => {
+    if (!row.visitor) return;
+    const item = visitorMap.get(row.visitor) || {
+      visitor: row.visitor, events: 0, views: 0, carts: 0, transactions: 0, logins: 0, products: new Set()
+    };
     item.events++;
-    if (r.event === "view") item.views++;
-    if (r.event === "cart") item.carts++;
-    if (r.event === "transaction") item.transactions++;
-    if (r.product && r.event === "transaction") item.products.add(r.product);
-    visitorMap.set(r.visitor, item);
+    if (row.event === "view") item.views++;
+    if (row.event === "cart") item.carts++;
+    if (row.event === "transaction") {
+      item.transactions++;
+      if (row.product) item.products.add(row.product);
+    }
+    if (row.event === "login" || row.isLoggedIn) item.logins++;
+    visitorMap.set(row.visitor, item);
   });
-  const topVisitors = [...visitorMap.values()].map(v => ({ ...v, distinctProducts: v.products.size })).sort((a, b) => b.transactions - a.transactions || b.events - a.events).slice(0, 8);
-  const days = new Map();
-  rows.forEach(r => {
-    if (!r.timestamp || !Number.isFinite(r.timestamp.getTime())) return;
-    const key = r.timestamp.toISOString().slice(0, 10);
-    const item = days.get(key) || { date: key, views: 0, carts: 0, transactions: 0 };
-    if (r.event === "view") item.views++;
-    if (r.event === "cart") item.carts++;
-    if (r.event === "transaction") item.transactions++;
-    days.set(key, item);
+
+  const session = calculateSessionMetrics(rows, data.schema);
+  const dailyMap = new Map();
+  const hourlyMap = new Map();
+  rows.forEach(row => {
+    if (!row.timestamp) return;
+    const date = row.timestamp.toISOString().slice(0, 10);
+    const hour = row.timestamp.getUTCHours();
+    const daily = dailyMap.get(date) || { date, views: 0, carts: 0, transactions: 0 };
+    const hourly = hourlyMap.get(hour) || { hour, views: 0, carts: 0, transactions: 0 };
+    if (row.event === "view") { daily.views++; hourly.views++; }
+    if (row.event === "cart") { daily.carts++; hourly.carts++; }
+    if (row.event === "transaction") { daily.transactions++; hourly.transactions++; }
+    dailyMap.set(date, daily);
+    hourlyMap.set(hour, hourly);
   });
-  const trend = [...days.values()].sort((a, b) => a.date.localeCompare(b.date));
+
+  const views = counts.view;
+  const carts = counts.cart;
+  const transactions = counts.transaction;
   const eventMix = [
     { name: "Views", value: views, color: COLORS[0] },
     { name: "Add to cart", value: carts, color: COLORS[1] },
     { name: "Transactions", value: transactions, color: COLORS[2] },
-    { name: "Other", value: rows.length - views - carts - transactions, color: "#657086" }
-  ].filter(x => x.value > 0);
-  const revenue = data.schema.revenue ? rows.reduce((sum, r) => sum + (Number.isFinite(r.revenue) ? r.revenue : 0), 0) : null;
+    { name: "Clicks", value: clicks, color: COLORS[3] },
+    { name: "Logins", value: logins, color: COLORS[4] }
+  ].filter(item => item.value > 0);
+
+  const transactionRows = rows.filter(row => row.event === "transaction" && row.revenue !== null);
+  const revenue = data.schema.revenue && transactionRows.length
+    ? transactionRows.reduce((sum, row) => sum + (row.revenue || 0), 0)
+    : null;
+
   return {
-    total: rows.length, visitors, products, views, carts, transactions,
+    total: rows.length,
+    visitors,
+    products,
+    views,
+    carts,
+    transactions,
+    clicks,
+    impressions,
+    clickRate: impressions > 0 ? clicks / impressions * 100 : null,
+    clickRateAvailable: clickAvailable && impressions > 0,
+    logins,
+    loginVisitors,
+    loginAvailable,
     cartRate: views ? carts / views * 100 : 0,
     transactionRate: views ? transactions / views * 100 : 0,
-    topProducts, topCart, topVisitors, trend: trend.slice(-30), eventMix, revenue,
+    cartToTransactionRate: carts ? transactions / carts * 100 : 0,
+    topProducts: topBy("views"),
+    topCart: topBy("carts"),
+    topTransactionProducts: topBy("transactions"),
+    topVisitors: [...visitorMap.values()]
+      .map(visitor => ({ ...visitor, distinctProducts: visitor.products.size }))
+      .sort((a, b) => b.transactions - a.transactions || b.events - a.events)
+      .slice(0, 15),
+    trend: [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-45),
+    hourly: [...hourlyMap.values()].sort((a, b) => a.hour - b.hour),
+    eventMix,
+    session,
+    sessionAvailable: session.available,
+    avgSessionDurationMin: session.avg,
+    medianSessionDurationMin: session.median,
+    revenue,
     productMap
+  };
+}
+
+function makeRetailrocketMetrics(summary) {
+  const event = summary.event_counts;
+  const sessions = summary.sessions;
+  const mapProducts = items => items.map(item => ({
+    product: item.product_id,
+    views: item.views,
+    carts: item.cart_events,
+    transactions: item.transaction_events,
+    cart_to_view_pct: item.cart_to_view_pct,
+    transaction_to_view_pct: item.transaction_to_view_pct
+  }));
+  return {
+    total: summary.rows,
+    visitors: summary.unique_visitors,
+    products: summary.unique_products,
+    views: event.views,
+    carts: event.cart_events,
+    transactions: event.transaction_events,
+    clicks: 0,
+    impressions: 0,
+    clickRate: null,
+    clickRateAvailable: false,
+    logins: 0,
+    loginVisitors: 0,
+    loginAvailable: false,
+    cartRate: summary.ratios.cart_events_per_view_pct,
+    transactionRate: summary.ratios.transaction_events_per_view_pct,
+    cartToTransactionRate: summary.ratios.transaction_events_per_cart_event_pct,
+    topProducts: mapProducts(summary.top_view_products),
+    topCart: mapProducts(summary.top_cart_products),
+    topTransactionProducts: mapProducts(summary.top_transaction_products),
+    topVisitors: summary.top_visitors_by_transactions.map(item => ({
+      visitor: item.visitor_id,
+      events: null,
+      views: null,
+      carts: null,
+      transactions: item.transaction_events,
+      logins: null,
+      distinctProducts: item.distinct_products,
+      uniqueTransactionIds: item.unique_transaction_ids
+    })),
+    trend: [],
+    hourly: summary.hourly_activity,
+    eventMix: [
+      { name: "Views", value: event.views, color: COLORS[0] },
+      { name: "Add to cart", value: event.cart_events, color: COLORS[1] },
+      { name: "Transactions", value: event.transaction_events, color: COLORS[2] }
+    ],
+    session: {
+      available: true,
+      method: sessions.sessionization,
+      count: sessions.estimated_sessions,
+      avg: sessions.avg_duration_min_multi_event,
+      median: sessions.median_duration_min_multi_event,
+      p90: sessions.p90_duration_min_multi_event,
+      multiEventCount: sessions.sessions_with_multiple_events,
+      singleEventSessions: sessions.single_event_sessions
+    },
+    sessionAvailable: true,
+    avgSessionDurationMin: sessions.avg_duration_min_multi_event,
+    medianSessionDurationMin: sessions.median_duration_min_multi_event,
+    revenue: null,
+    productMap: new Map(),
+    dateRange: summary.date_start + " to " + summary.date_end,
+    coverage: summary.coverage
   };
 }
 
@@ -218,9 +518,61 @@ function retrieveDocs(question, docs) {
 function answerQuestion(question, data, metrics) {
   const q = question.toLowerCase();
   const compact = q.replace(/[^a-z0-9\s]/g, " ");
+
+  if (/click.?through|click rate|ctr|impression/.test(compact)) {
+    if (!metrics.clickRateAvailable) {
+      return {
+        answer: "Click-through rate cannot be calculated from the active dataset. CTR requires both impression counts and click counts. This dataset has no explicit impression or click records.",
+        rows: [],
+        explanation: "Product views are not interchangeable with ad or search impressions."
+      };
+    }
+    return {
+      answer: "The calculated click-through rate is " + pct(metrics.clickRate) + ", using " + fmt(metrics.clicks) + " clicks divided by " + fmt(metrics.impressions) + " impressions.",
+      rows: [{ impressions: metrics.impressions, clicks: metrics.clicks, click_through_rate: pct(metrics.clickRate) }],
+      explanation: "CTR = clicks / impressions × 100."
+    };
+  }
+
+  if (/login|logins|signed in|sign in|logged in/.test(compact)) {
+    if (!metrics.loginAvailable) {
+      return {
+        answer: "Login activity is not captured in this dataset. I cannot identify login events or count authenticated visitors from the available columns.",
+        rows: [],
+        explanation: "A visitor ID is not proof that the visitor logged in."
+      };
+    }
+    return {
+      answer: "The dataset contains " + fmt(metrics.logins) + " recorded login signals from " + fmt(metrics.loginVisitors) + " distinct visitor IDs.",
+      rows: [{ login_events: metrics.logins, unique_logged_in_visitors: metrics.loginVisitors }],
+      explanation: "Login counts are based on the detected login event or login-status field."
+    };
+  }
+
+  if (/session|session time|session duration|time spent|time on site|visit duration/.test(compact)) {
+    if (!metrics.sessionAvailable) {
+      return {
+        answer: "Session duration could not be calculated because the dataset has no usable session ID or visitor/timestamp combination, and no explicit session-duration field.",
+        rows: [],
+        explanation: "Upload a session ID, session duration, or visitor ID plus timestamp to support this analysis."
+      };
+    }
+    const session = metrics.session;
+    return {
+      answer: "The dataset contains approximately " + fmt(session.count) + " sessions. The average observed duration for sessions with multiple events is " + Number(session.avg || 0).toFixed(2) + " minutes, and the median is " + Number(session.median || 0).toFixed(2) + " minutes.",
+      rows: [
+        { metric: "Sessions", value: session.count },
+        { metric: "Average multi-event session duration (min)", value: Number(session.avg || 0).toFixed(2) },
+        { metric: "Median multi-event session duration (min)", value: Number(session.median || 0).toFixed(2) },
+        { metric: "90th percentile duration (min)", value: Number(session.p90 || 0).toFixed(2) }
+      ],
+      explanation: session.method + ". Single-event sessions are excluded from average-duration calculations."
+    };
+  }
+
   if (/overview|summary|summarize|how many rows|total events|dataset size|dataset contain/.test(compact)) {
     return {
-      answer: "Your dataset contains " + fmt(metrics.total) + " records, " + fmt(metrics.visitors) + " distinct visitor identifiers and " + fmt(metrics.products) + " distinct product identifiers. I counted " + fmt(metrics.views) + " view events, " + fmt(metrics.carts) + " add-to-cart events and " + fmt(metrics.transactions) + " transaction events.",
+      answer: "The active dataset contains " + fmt(metrics.total) + " records, " + fmt(metrics.visitors) + " distinct visitor IDs and " + fmt(metrics.products) + " distinct product IDs. I counted " + fmt(metrics.views) + " views, " + fmt(metrics.carts) + " add-to-cart events and " + fmt(metrics.transactions) + " transaction events.",
       rows: [
         { metric: "Total records", value: metrics.total },
         { metric: "Unique visitor IDs", value: metrics.visitors },
@@ -229,38 +581,95 @@ function answerQuestion(question, data, metrics) {
         { metric: "Add-to-cart events", value: metrics.carts },
         { metric: "Transaction events", value: metrics.transactions }
       ],
-      explanation: "Counts are calculated from the currently loaded dataset."
+      explanation: "Counts are calculated from the currently selected dataset."
     };
   }
-  if (/most view|top view|popular product|product.*view|view.*product/.test(compact)) {
-    return { answer: "These are the products with the highest recorded view-event counts in the loaded dataset.", rows: metrics.topProducts.map(x => ({ product: x.product, views: x.views, add_to_cart: x.carts, transactions: x.transactions })), explanation: "This ranking measures view events, not unique viewers, revenue or profit." };
+
+  if (/funnel|journey|conversion|cart to view|transaction to view/.test(compact)) {
+    return {
+      answer: "The recorded event journey contains " + fmt(metrics.views) + " views, " + fmt(metrics.carts) + " add-to-cart events and " + fmt(metrics.transactions) + " transaction events. Cart-to-view event ratio: " + pct(metrics.cartRate) + ". Transaction-to-view event ratio: " + pct(metrics.transactionRate) + ".",
+      rows: [
+        { stage: "Product views", events: metrics.views },
+        { stage: "Add to cart", events: metrics.carts },
+        { stage: "Transaction events", events: metrics.transactions }
+      ],
+      explanation: "These are event ratios, not deduplicated user-level conversion rates or a session-level funnel."
+    };
   }
-  if (/add.*cart|cart.*product|cart activity/.test(compact)) {
-    return { answer: "These products have the highest recorded add-to-cart activity.", rows: metrics.topCart.map(x => ({ product: x.product, add_to_cart_events: x.carts, views: x.views, transactions: x.transactions })), explanation: "An add-to-cart event does not guarantee a completed purchase." };
-  }
+
   if (/visitor|customer|user/.test(compact) && /transaction|purchase|buy|bought|order/.test(compact)) {
-    return { answer: "These anonymous visitor IDs have the most recorded transaction events.", rows: metrics.topVisitors.map(x => ({ visitor_id: x.visitor, transaction_events: x.transactions, distinct_products_in_transactions: x.distinctProducts, total_events: x.events })), explanation: "Visitor IDs are anonymous. Transaction events are not guaranteed to equal unique orders." };
+    return {
+      answer: "These anonymous visitor IDs have the highest recorded transaction-event counts.",
+      rows: metrics.topVisitors.map(item => ({
+        visitor_id: item.visitor,
+        transaction_events: item.transactions,
+        distinct_products_in_transactions: item.distinctProducts
+      })),
+      explanation: "Visitor IDs are anonymous. Transaction events are not guaranteed to equal unique completed orders."
+    };
   }
-  if (/funnel|conversion|cart to view|transaction to view/.test(compact)) {
-    return { answer: "The recorded event funnel contains " + fmt(metrics.views) + " view events, " + fmt(metrics.carts) + " add-to-cart events and " + fmt(metrics.transactions) + " transaction events. The add-to-cart-to-view event ratio is " + pct(metrics.cartRate) + " and the transaction-to-view event ratio is " + pct(metrics.transactionRate) + ".", rows: [{ stage: "Views", events: metrics.views }, { stage: "Add to cart", events: metrics.carts }, { stage: "Transactions", events: metrics.transactions }], explanation: "These are event ratios, not verified unique-customer conversion rates." };
+
+  if (/product|item/.test(compact) && /view|cart|transaction|purchase|buy/.test(compact)) {
+    const source = /transaction|purchase|buy/.test(compact) ? metrics.topTransactionProducts
+      : /cart/.test(compact) ? metrics.topCart
+      : metrics.topProducts;
+    return {
+      answer: "Here is the product-level journey breakdown, showing recorded views, cart events and transaction events for the leading products.",
+      rows: source.map(item => ({
+        product_id: item.product,
+        views: item.views,
+        add_to_cart_events: item.carts,
+        transaction_events: item.transactions,
+        cart_to_view_event_pct: pct(item.views ? item.carts / item.views * 100 : 0),
+        transaction_to_view_event_pct: pct(item.views ? item.transactions / item.views * 100 : 0)
+      })),
+      explanation: "Aggregated product event counts; records are not linked into unique user journeys."
+    };
   }
-  if (/trend|over time|daily|day by day|activity/.test(compact)) {
-    return { answer: "Here is the recent daily event activity available from your dataset. The chart separates views, cart events and transaction events.", rows: metrics.trend, explanation: "Daily trends include only records with a valid timestamp." };
+
+  if (/trend|over time|daily|day by day|activity|hour|peak/.test(compact)) {
+    return {
+      answer: "The hourly activity table shows when views, cart events and transaction events were recorded.",
+      rows: metrics.hourly.map(item => ({
+        hour_utc: String(item.hour).padStart(2, "0") + ":00",
+        views: item.views,
+        cart_events: item.carts ?? item.cart_events,
+        transaction_events: item.transactions ?? item.transaction_events
+      })),
+      explanation: "Times are shown in UTC when timestamps are available."
+    };
   }
+
   if (/revenue|sales value|total sales/.test(compact)) {
-    if (metrics.revenue === null) return { answer: "I can't calculate revenue from this dataset because I couldn't identify a revenue, sales, amount or order-value column. Please upload a dataset containing a suitable monetary field.", rows: [], explanation: "No revenue field was detected." };
-    return { answer: "The sum of the detected numeric revenue field is " + fmt(metrics.revenue) + ". Please confirm the field's currency and whether each row represents a transaction or an event.", rows: [{ metric: "Sum of detected revenue field", value: metrics.revenue }], explanation: "The detected field is heuristic and needs confirmation." };
+    if (metrics.revenue === null) {
+      return {
+        answer: "Revenue cannot be calculated from this dataset because no suitable monetary field was detected.",
+        rows: [],
+        explanation: "The Retailrocket events file does not contain product price or transaction value."
+      };
+    }
+    return {
+      answer: "The sum of the detected revenue field is " + fmt(metrics.revenue) + ". Confirm the currency and row-level meaning before interpreting it.",
+      rows: [{ metric: "Revenue field sum", value: metrics.revenue }],
+      explanation: "The revenue field was detected heuristically."
+    };
   }
+
   if (/column|schema|field|missing|null|duplicate|profile/.test(compact)) {
     const p = profileDataset(data);
-    return { answer: "I identified " + p.length + " columns. The table shows inferred data types, missing values, unique values and sample content.", rows: p, explanation: "Column roles are inferred heuristically from names and values." };
+    return {
+      answer: "I identified " + p.length + " columns. The table shows inferred data types, missing values, unique values and sample content.",
+      rows: p,
+      explanation: "Column roles are inferred heuristically from names and values."
+    };
   }
+
   return null;
 }
 
 export default function App() {
-  const [rawRows, setRawRows] = useState(makeDemoData);
-  const [sourceName, setSourceName] = useState("Demo workspace · synthetic sample");
+  const [rawRows, setRawRows] = useState([]);
+  const [sourceName, setSourceName] = useState("Retailrocket events.csv · historical reference");
   const [demoMode, setDemoMode] = useState(true);
   const [active, setActive] = useState("overview");
   const [query, setQuery] = useState("");
@@ -275,8 +684,8 @@ export default function App() {
   const chatEndRef = useRef(null);
 
   const data = useMemo(() => normalizeRows(rawRows), [rawRows]);
-  const metrics = useMemo(() => aggregate(data), [data]);
-  const profile = useMemo(() => profileDataset(data), [data]);
+  const metrics = useMemo(() => demoMode ? makeRetailrocketMetrics(RETAILROCKET) : aggregate(data), [demoMode, data]);
+  const profile = useMemo(() => demoMode ? RETAILROCKET.columns.map(name => ({ name, type: name === "timestamp" ? "Unix timestamp (ms)" : name === "visitorid" || name === "itemid" || name === "transactionid" ? "Identifier" : "Category", missing: name === "transactionid" ? 2738429 : 0, unique: null, sample: name === "event" ? "view, addtocart, transaction" : "Retailrocket field" })) : profileDataset(data), [demoMode, data]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -320,6 +729,7 @@ export default function App() {
   };
 
   const downloadCSV = () => {
+    if (!rawRows.length) { setNotice("The reference view contains verified aggregates, not raw export rows. Upload the CSV to export source records."); return; }
     const fields = data.headers.length ? data.headers : Object.keys(rawRows[0] || {});
     const csv = Papa.unparse(rawRows.slice(0, 5000));
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -385,24 +795,24 @@ export default function App() {
   };
 
   const navItems = [
-    { id: "overview", label: "Overview", icon: LayoutDashboard, group: "WORKSPACE" },
+    { id: "overview", label: "Customer journey", icon: LayoutDashboard, group: "WORKSPACE" },
     { id: "products", label: "Product intelligence", icon: ShoppingBag },
     { id: "customers", label: "Customer behaviour", icon: Users },
-    { id: "trends", label: "Trends & funnel", icon: Activity },
+    { id: "trends", label: "Journey & timing", icon: Activity },
     { id: "assistant", label: "AI analyst", icon: MessageSquare, group: "INTELLIGENCE" },
     { id: "knowledge", label: "Knowledge retrieval", icon: BookOpen }
   ];
 
   const quickPrompts = [
-    "Which products get the most views?",
-    "Who has the most transaction events?",
-    "Show me the event funnel",
-    "How has activity changed over time?"
+    "Which product got the most views and what happened next?",
+    "Which products reached cart and transaction events?",
+    "What is the average estimated session duration?",
+    "Is click-through rate available in this dataset?"
   ];
 
   const resetDemo = () => {
-    setRawRows(makeDemoData());
-    setSourceName("Demo workspace · synthetic sample");
+    setRawRows([]);
+    setSourceName("Retailrocket events.csv · historical reference");
     setDemoMode(true);
     setMessages([]);
     setNotice("Demo dataset restored.");
@@ -433,7 +843,7 @@ export default function App() {
       </div>
       <div className="sidebar-bottom">
         <div className="data-card">
-          <div className="data-card-head"><span className="live-dot"/><span>{demoMode ? "DEMO DATA" : "UPLOADED DATA"}</span><span className="data-more">•••</span></div>
+          <div className="data-card-head"><span className="live-dot"/><span>{demoMode ? "RETAILROCKET REFERENCE" : "UPLOADED DATA"}</span><span className="data-more">•••</span></div>
           <b className="data-name">{sourceName}</b>
           <div className="data-stats"><span>{fmt(metrics.total)} rows</span><span>{data.headers.length || Object.keys(rawRows[0] || {}).length} columns</span></div>
           <button className="upload-btn" onClick={() => fileRef.current?.click()}><FileUp size={15}/> Replace dataset</button>
@@ -456,7 +866,7 @@ export default function App() {
       </div>
       <div className="top-actions">
         <div className="search-pill"><Search size={15}/><span>Search workspace</span><kbd>⌘ K</kbd></div>
-        <div className="status-pill"><span className="live-dot"/> {demoMode ? "Demo environment" : "Dataset loaded"}</div>
+        <div className="status-pill"><span className="live-dot"/> {demoMode ? "Historical case study" : "Dataset loaded"}</div>
         <button className="avatar-btn">GG</button>
       </div>
     </header>
@@ -471,35 +881,181 @@ export default function App() {
 
   const renderOverview = () => (
     <>
-      <div className="page-intro">
-        <div><div className="eyebrow"><span className="live-dot"/> COMMERCE PERFORMANCE / LIVE WORKSPACE</div><h1>See the story<br/><em>behind every signal.</em></h1><p>Explore customer interactions, uncover product patterns, and turn raw commerce events into decisions.</p></div>
-        <div className="intro-actions"><button className="btn btn-secondary" onClick={downloadCSV}><Download size={15}/> Export sample</button><button className="btn btn-primary" onClick={() => setActive("assistant")}><Sparkles size={15}/> Ask the analyst</button></div>
+      <div className="page-intro journey-hero">
+        <div>
+          <div className="eyebrow"><span className="live-dot"/> CUSTOMER JOURNEY INTELLIGENCE / HISTORICAL CASE STUDY</div>
+          <h1>From first view<br/><em>to transaction.</em></h1>
+          <p>Trace product discovery, cart intent and transaction activity. See where attention turns into action—and where the available event trail stops.</p>
+        </div>
+        <div className="intro-actions">
+          <button className="btn btn-secondary" onClick={downloadCSV}><Download size={15}/> Export source rows</button>
+          <button className="btn btn-primary" onClick={() => setActive("assistant")}><Sparkles size={15}/> Ask about the journey</button>
+        </div>
       </div>
-      <div className="dataset-banner"><div className="db-icon"><Database size={18}/></div><div className="db-copy"><b>{sourceName}</b><span>{demoMode ? "Synthetic sample for demonstration · upload your CSV to analyze your own data" : "Your uploaded CSV is being analyzed in this browser session"}</span></div><div className="db-right"><span className="tag tag-green">{demoMode ? "SAMPLE DATA" : "ACTIVE DATASET"}</span><button className="text-link" onClick={() => setActive("knowledge")}>Data profile <ArrowUpRight size={13}/></button></div></div>
-      <div className="metric-grid">
-        {metricCards.map((m, i) => <div className="metric-card" key={m.label}><div className="metric-top"><span>{m.label}</span><div className={"metric-icon " + m.color}><m.icon size={17}/></div></div><div className="metric-value">{m.value}</div><div className="metric-foot"><span>{m.sub}</span><span className="metric-note">{m.trend}</span></div></div>)}
+
+      <div className="dataset-banner journey-banner">
+        <div className="db-icon"><Database size={18}/></div>
+        <div className="db-copy">
+          <b>{sourceName}</b>
+          <span>{demoMode ? "Verified event aggregates · 03 May–18 Sep 2015 · UTC" : "Uploaded dataset · metrics calculated from detected columns"}</span>
+        </div>
+        <div className="db-right">
+          <span className="tag tag-green">{demoMode ? "REFERENCE DATA" : "ACTIVE DATASET"}</span>
+          <button className="text-link" onClick={() => setActive("knowledge")}>Inspect schema <ArrowUpRight size={13}/></button>
+        </div>
       </div>
-      <div className="content-grid main-charts">
-        <section className="panel chart-panel wide-panel">
-          <div className="panel-heading"><div><div className="eyebrow">ENGAGEMENT OVER TIME</div><h3>Interaction activity</h3><p>Daily views, cart actions and transactions</p></div><div className="legend"><span><i className="dot mint-dot"/> Views</span><span><i className="dot violet-dot"/> Cart</span><span><i className="dot teal-dot"/> Transactions</span></div></div>
-          <div className="chart-wrap"><ResponsiveContainer width="100%" height="100%"><AreaChart data={metrics.trend}><defs><linearGradient id="viewsGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#c8f169" stopOpacity={0.25}/><stop offset="95%" stopColor="#c8f169" stopOpacity={0}/></linearGradient></defs><CartesianGrid stroke="#252c39" vertical={false}/><XAxis dataKey="date" tickFormatter={v => v.slice(5)} stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={10} width={38}/><Tooltip contentStyle={{background:"#151a23",border:"1px solid #303849",borderRadius:12,color:"#fff"}}/><Area type="monotone" dataKey="views" stroke="#c8f169" fill="url(#viewsGrad)" strokeWidth={2.2}/><Area type="monotone" dataKey="carts" stroke="#a995ff" fill="transparent" strokeWidth={2}/><Area type="monotone" dataKey="transactions" stroke="#62d5c8" fill="transparent" strokeWidth={2}/></AreaChart></ResponsiveContainer></div>
-          <div className="chart-caption"><span><Clock3 size={13}/> Last {metrics.trend.length} days with valid timestamps</span><span>Source: {demoMode ? "synthetic demo events" : sourceName}</span></div>
+
+      <div className="journey-metrics-grid">
+        <div className="journey-metric-card">
+          <div className="journey-metric-top"><span>PRODUCT VIEWS</span><Eye size={16}/></div>
+          <b>{fmt(metrics.views)}</b>
+          <small>Recorded product-view events</small>
+          <div className="metric-accent mint-accent"/>
+        </div>
+        <div className="journey-metric-card">
+          <div className="journey-metric-top"><span>ADD TO CART</span><ShoppingCart size={16}/></div>
+          <b>{fmt(metrics.carts)}</b>
+          <small>{pct(metrics.cartRate)} cart events per view event</small>
+          <div className="metric-accent violet-accent"/>
+        </div>
+        <div className="journey-metric-card">
+          <div className="journey-metric-top"><span>TRANSACTION EVENTS</span><ShoppingBag size={16}/></div>
+          <b>{fmt(metrics.transactions)}</b>
+          <small>{pct(metrics.transactionRate)} transaction events per view event</small>
+          <div className="metric-accent teal-accent"/>
+        </div>
+        <div className="journey-metric-card unavailable-metric">
+          <div className="journey-metric-top"><span>CLICK-THROUGH RATE</span><MousePointerClick size={16}/></div>
+          <b>{metrics.clickRateAvailable ? pct(metrics.clickRate) : "Not captured"}</b>
+          <small>{metrics.clickRateAvailable ? fmt(metrics.clicks) + " clicks / " + fmt(metrics.impressions) + " impressions" : "Needs click + impression records"}</small>
+          <div className="metric-accent amber-accent"/>
+        </div>
+        <div className="journey-metric-card">
+          <div className="journey-metric-top"><span>AVG. SESSION WINDOW</span><Hourglass size={16}/></div>
+          <b>{metrics.sessionAvailable && metrics.avgSessionDurationMin !== null ? metrics.avgSessionDurationMin.toFixed(2) + " min" : "Unavailable"}</b>
+          <small>{metrics.sessionAvailable ? "Estimated / observed, see method below" : "Needs session or visitor-time fields"}</small>
+          <div className="metric-accent blue-accent"/>
+        </div>
+        <div className="journey-metric-card unavailable-metric">
+          <div className="journey-metric-top"><span>LOGIN ACTIVITY</span><LogIn size={16}/></div>
+          <b>{metrics.loginAvailable ? fmt(metrics.logins) : "Not captured"}</b>
+          <small>{metrics.loginAvailable ? fmt(metrics.loginVisitors) + " distinct signed-in visitor IDs" : "No login event or login-status field"}</small>
+          <div className="metric-accent rose-accent"/>
+        </div>
+      </div>
+
+      <div className="section-kicker-row">
+        <div><div className="eyebrow">THE BEHAVIOURAL PATH</div><h2>Where does the journey move forward?</h2><p>Recorded event volume at each measurable stage.</p></div>
+        <span className="tag tag-green">EVENT-LEVEL FUNNEL</span>
+      </div>
+      <section className="journey-flow">
+        <div className="journey-stage-card">
+          <div className="stage-index">01 / DISCOVERY</div>
+          <div className="stage-icon mint-stage"><Eye size={18}/></div>
+          <b>{fmt(metrics.views)}</b>
+          <span>Product views</span>
+          <small>100% baseline</small>
+          <div className="stage-track"><i style={{width:"100%"}}/></div>
+        </div>
+        <div className="journey-connector"><ArrowDownRight size={18}/><span>{pct(metrics.cartRate)} of view events</span></div>
+        <div className="journey-stage-card">
+          <div className="stage-index">02 / INTENT</div>
+          <div className="stage-icon violet-stage"><ShoppingCart size={18}/></div>
+          <b>{fmt(metrics.carts)}</b>
+          <span>Add-to-cart events</span>
+          <small>{pct(metrics.cartRate)} of view events</small>
+          <div className="stage-track"><i className="violet-track" style={{width:Math.max(metrics.cartRate,1)+"%"}}/></div>
+        </div>
+        <div className="journey-connector"><ArrowDownRight size={18}/><span>{pct(metrics.cartToTransactionRate)} of cart events</span></div>
+        <div className="journey-stage-card">
+          <div className="stage-index">03 / OUTCOME</div>
+          <div className="stage-icon teal-stage"><Check size={18}/></div>
+          <b>{fmt(metrics.transactions)}</b>
+          <span>Transaction events</span>
+          <small>{pct(metrics.transactionRate)} of view events</small>
+          <div className="stage-track"><i className="teal-track" style={{width:Math.max(metrics.transactionRate,1)+"%"}}/></div>
+        </div>
+      </section>
+
+      <div className="content-grid lower-grid journey-product-grid">
+        <section className="panel table-panel journey-table-panel">
+          <div className="panel-heading">
+            <div><div className="eyebrow">PRODUCT-LEVEL JOURNEY</div><h3>Views → cart → transaction</h3><p>Which products attracted attention, cart intent and transaction activity?</p></div>
+            <button className="text-link" onClick={() => setActive("products")}>Product detail <ArrowUpRight size={13}/></button>
+          </div>
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead><tr><th>Product ID</th><th>Views</th><th>Cart events</th><th>Transaction events</th><th>Cart / view</th><th>Transaction / view</th></tr></thead>
+              <tbody>{metrics.topProducts.slice(0,8).map(product => (
+                <tr key={product.product}>
+                  <td><b>{product.product}</b></td>
+                  <td>{fmt(product.views)}</td>
+                  <td>{fmt(product.carts)}</td>
+                  <td><span className="value-pill">{fmt(product.transactions)}</span></td>
+                  <td>{pct(product.views ? product.carts / product.views * 100 : 0)}</td>
+                  <td>{pct(product.views ? product.transactions / product.views * 100 : 0)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          <div className="table-note">Ratios compare event counts for the same product; they are not person-level conversion rates.</div>
         </section>
-        <section className="panel mix-panel">
-          <div className="panel-heading"><div><div className="eyebrow">EVENT DISTRIBUTION</div><h3>Engagement mix</h3><p>Share of recorded interactions</p></div></div>
-          <div className="donut-wrap"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={metrics.eventMix} dataKey="value" nameKey="name" innerRadius={66} outerRadius={90} paddingAngle={3} stroke="none">{metrics.eventMix.map((entry, i) => <Cell key={entry.name} fill={entry.color}/>)}</Pie><Tooltip contentStyle={{background:"#151a23",border:"1px solid #303849",borderRadius:12}}/></PieChart></ResponsiveContainer><div className="donut-center"><b>{fmt(metrics.total)}</b><span>events</span></div></div>
-          <div className="mix-legend">{metrics.eventMix.map((entry) => <div key={entry.name}><span><i style={{background:entry.color}}/>{entry.name}</span><b>{pct(metrics.total ? entry.value / metrics.total * 100 : 0)}</b></div>)}</div>
+
+        <section className="journey-insight-panel">
+          <div className="eyebrow">SIGNAL SPOTLIGHT</div>
+          <h3>High attention does not always become purchase activity.</h3>
+          <div className="spotlight-product">
+            <span>HIGHEST VIEW VOLUME</span>
+            <b>Product 187946</b>
+            <div><strong>3,410</strong><small>views</small></div>
+            <p>2 add-to-cart events · 0 transaction events</p>
+          </div>
+          <div className="spotlight-product spotlight-strong">
+            <span>STRONGEST CART + TRANSACTION VOLUME</span>
+            <b>Product 461686</b>
+            <div><strong>306</strong><small>cart events</small><strong>133</strong><small>transaction events</small></div>
+            <p>2,539 views · 12.05% cart/view event ratio</p>
+          </div>
+          <div className="spotlight-foot">These are aggregated event records, not linked individual customer paths.</div>
         </section>
       </div>
-      <div className="content-grid lower-grid">
-        <section className="panel">
-          <div className="panel-heading"><div><div className="eyebrow">PRODUCT DISCOVERY</div><h3>Most viewed products</h3><p>Ranked by recorded view events</p></div><button className="text-link" onClick={() => setActive("products")}>View all <ArrowUpRight size={13}/></button></div>
-          <div className="rank-list">{metrics.topProducts.slice(0,5).map((p,i) => <div className="rank-row" key={p.product}><span className="rank-num">0{i+1}</span><div className="rank-product"><b>{p.product}</b><span>{fmt(p.views)} views</span></div><div className="rank-bar"><i style={{width:(metrics.topProducts[0]?.views ? p.views/metrics.topProducts[0].views*100 : 0)+"%"}}/></div><strong>{fmt(p.views)}</strong></div>)}</div>
+
+      <div className="content-grid main-charts journey-lower-grid">
+        <section className="panel chart-panel">
+          <div className="panel-heading"><div><div className="eyebrow">SESSION TIMING</div><h3>How long do multi-event visits last?</h3><p>Session windows derived from visitor activity</p></div><span className="tag tag-green">30-MINUTE RULE</span></div>
+          {metrics.sessionAvailable ? (
+            <>
+              <div className="session-stat-grid">
+                <div><span>AVERAGE</span><b>{Number(metrics.session.avg || 0).toFixed(2)} min</b></div>
+                <div><span>MEDIAN</span><b>{Number(metrics.session.median || 0).toFixed(2)} min</b></div>
+                <div><span>90TH PERCENTILE</span><b>{Number(metrics.session.p90 || 0).toFixed(2)} min</b></div>
+              </div>
+              <div className="session-count-line"><Hourglass size={15}/><b>{fmt(metrics.session.count)}</b><span>estimated / detected sessions</span></div>
+              <div className="session-method">{metrics.session.method}. Single-event sessions are excluded from average duration.</div>
+            </>
+          ) : (
+            <div className="missing-state"><Info size={18}/><b>Session timing unavailable</b><p>Upload a session ID, duration field, or visitor ID with a timestamp. Large files should ideally provide an explicit session ID or duration column.</p></div>
+          )}
         </section>
-        <section className="insight-card">
-          <div className="insight-orb"><Sparkles size={20}/></div><div className="eyebrow">INTELLIGENCE NOTE</div><h3>Attention is only the beginning.</h3><p>Compare product views with cart and transaction activity to spot where customer interest may be dropping off.</p><button className="btn btn-light" onClick={() => {setActive("assistant");setQuery("Show me the event funnel");}}>Explore the funnel <ArrowUpRight size={14}/></button><div className="insight-decoration">✳</div>
+
+        <section className="panel chart-panel">
+          <div className="panel-heading"><div><div className="eyebrow">WHEN ACTIVITY HAPPENS</div><h3>Hourly behaviour profile</h3><p>Views, cart actions and transactions by UTC hour</p></div></div>
+          <div className="chart-wrap"><ResponsiveContainer width="100%" height="100%"><AreaChart data={metrics.hourly}><CartesianGrid stroke="#252c39" vertical={false}/><XAxis dataKey="hour" tickFormatter={v => String(v).padStart(2,"0")} stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={10} width={38}/><Tooltip contentStyle={{background:"#151a23",border:"1px solid #303849",borderRadius:12,color:"#fff"}}/><Area type="monotone" dataKey="views" stroke="#c8f169" fill="#c8f169" fillOpacity={0.12} strokeWidth={2}/><Area type="monotone" dataKey="carts" stroke="#a995ff" fill="transparent" strokeWidth={2}/><Area type="monotone" dataKey="transactions" stroke="#62d5c8" fill="transparent" strokeWidth={2}/></AreaChart></ResponsiveContainer></div>
         </section>
       </div>
+
+      <div className="coverage-grid">
+        <div className="coverage-card">
+          <div className="coverage-icon amber-coverage"><MousePointerClick size={17}/></div>
+          <div><span>CLICK-THROUGH RATE</span><b>{metrics.clickRateAvailable ? pct(metrics.clickRate) : "Not measurable from this file"}</b><p>{metrics.clickRateAvailable ? "Calculated from detected click and impression fields." : "No impression and click fields/events were present. Product views cannot be substituted for impressions."}</p></div>
+        </div>
+        <div className="coverage-card">
+          <div className="coverage-icon rose-coverage"><LogIn size={17}/></div>
+          <div><span>LOGIN / AUTHENTICATION</span><b>{metrics.loginAvailable ? fmt(metrics.logins) + " login signals" : "Not captured in this file"}</b><p>{metrics.loginAvailable ? fmt(metrics.loginVisitors) + " distinct visitor IDs with login signals." : "No login event or login-status field was found. Anonymous visitor IDs do not prove a login."}</p></div>
+        </div>
+      </div>
+
+      <div className="notice-box journey-caveat"><AlertCircle size={17}/><div><b>How to interpret this analysis</b><p>The Retailrocket file covers 03 May–18 September 2015 and contains event logs for views, add-to-cart and transactions. Session durations are inferred by grouping each visitor's events with a 30-minute inactivity threshold; they are estimates, not source-provided session records. Event ratios are not unique-customer conversion rates. The file has no impressions, click events, login events, revenue or explicit session IDs.</p></div></div>
     </>
   );
 
@@ -521,27 +1077,31 @@ export default function App() {
 
   const renderCustomers = () => (
     <>
-      <div className="section-title"><div><div className="eyebrow">AUDIENCE INTELLIGENCE</div><h1>Customer <em>behaviour.</em></h1><p>Understand anonymous visitor activity across the recorded journey.</p></div></div>
+      <div className="section-title"><div><div className="eyebrow">AUDIENCE INTELLIGENCE</div><h1>Customer <em>behaviour.</em></h1><p>Understand anonymous visitor activity, transaction frequency and session timing from the recorded event trail.</p></div></div>
       <div className="metric-grid three">
         <div className="metric-card"><div className="metric-top"><span>Unique visitor IDs</span><Users size={17}/></div><div className="metric-value">{fmt(metrics.visitors)}</div><div className="metric-foot">Distinct anonymous identifiers</div></div>
-        <div className="metric-card"><div className="metric-top"><span>Average events / visitor</span><Activity size={17}/></div><div className="metric-value">{metrics.visitors? (metrics.total/metrics.visitors).toFixed(2):"—"}</div><div className="metric-foot">Across visitors in this dataset</div></div>
-        <div className="metric-card"><div className="metric-top"><span>Transaction events</span><ShoppingCart size={17}/></div><div className="metric-value">{fmt(metrics.transactions)}</div><div className="metric-foot">Not unique orders</div></div>
+        <div className="metric-card"><div className="metric-top"><span>Estimated sessions</span><Hourglass size={17}/></div><div className="metric-value">{metrics.sessionAvailable ? fmt(metrics.session.count) : "Unavailable"}</div><div className="metric-foot">{metrics.sessionAvailable ? "30-minute inactivity grouping or explicit session field" : "No session data detected"}</div></div>
+        <div className="metric-card"><div className="metric-top"><span>Login signals</span><LogIn size={17}/></div><div className="metric-value">{metrics.loginAvailable ? fmt(metrics.logins) : "Not captured"}</div><div className="metric-foot">{metrics.loginAvailable ? fmt(metrics.loginVisitors) + " distinct logged-in visitor IDs" : "No login fields/events in source"}</div></div>
       </div>
-      <section className="panel table-panel"><div className="panel-heading"><div><div className="eyebrow">VISITOR RANKING</div><h3>Most transaction-active visitors</h3><p>Ranked by recorded transaction events</p></div><span className="tag tag-green">ANONYMIZED IDs</span></div><div className="table-scroll"><table className="data-table"><thead><tr><th>Visitor ID</th><th>Total events</th><th>Views</th><th>Cart events</th><th>Transaction events</th><th>Distinct purchased products</th></tr></thead><tbody>{metrics.topVisitors.map((v,i)=><tr key={v.visitor}><td><b>{v.visitor}</b></td><td>{fmt(v.events)}</td><td>{fmt(v.views)}</td><td>{fmt(v.carts)}</td><td><span className="value-pill">{fmt(v.transactions)}</span></td><td>{fmt(v.distinctProducts)}</td></tr>)}</tbody></table></div><div className="table-note">Visitor IDs are anonymous identifiers, not identifiable people.</div></section>
-      <section className="notice-box"><AlertCircle size={17}/><div><b>Interpretation note</b><p>This dataset does not directly provide personal identities, demographics, customer lifetime value or verified product quantities. The rankings describe recorded event activity only.</p></div></section>
+      <section className="panel table-panel"><div className="panel-heading"><div><div className="eyebrow">VISITOR RANKING</div><h3>Most transaction-active visitors</h3><p>Ranked by recorded transaction events</p></div><span className="tag tag-green">ANONYMIZED IDs</span></div><div className="table-scroll"><table className="data-table"><thead><tr><th>Visitor ID</th><th>Transaction events</th><th>Distinct purchased products</th><th>Unique transaction IDs</th></tr></thead><tbody>{metrics.topVisitors.map(visitor=><tr key={visitor.visitor}><td><b>{visitor.visitor}</b></td><td><span className="value-pill">{fmt(visitor.transactions)}</span></td><td>{fmt(visitor.distinctProducts)}</td><td>{visitor.uniqueTransactionIds === undefined ? "—" : fmt(visitor.uniqueTransactionIds)}</td></tr>)}</tbody></table></div><div className="table-note">Visitor IDs are anonymous. These rankings do not identify real people.</div></section>
+      <div className="coverage-grid">
+        <div className="coverage-card"><div className="coverage-icon blue-coverage"><Hourglass size={17}/></div><div><span>SESSION DURATION</span><b>{metrics.sessionAvailable ? Number(metrics.session.avg || 0).toFixed(2) + " min average" : "Unavailable"}</b><p>{metrics.sessionAvailable ? metrics.session.method + ". Average uses multi-event sessions." : "Provide a session ID, session duration, or visitor ID plus timestamp."}</p></div></div>
+        <div className="coverage-card"><div className="coverage-icon rose-coverage"><LogIn size={17}/></div><div><span>LOGIN COVERAGE</span><b>{metrics.loginAvailable ? "Available" : "No login records"}</b><p>Login analysis requires a login/sign-in event or explicit authentication-status column.</p></div></div>
+      </div>
+      <section className="notice-box"><AlertCircle size={17}/><div><b>Privacy and interpretation</b><p>The Retailrocket visitor IDs are anonymous identifiers. The dataset does not include names, email addresses, or demographic identities. Session windows are inferred and should not be presented as exact tracked sessions.</p></div></section>
     </>
   );
 
   const renderTrends = () => (
     <>
-      <div className="section-title"><div><div className="eyebrow">JOURNEY & MOMENTUM</div><h1>Trends <em>& funnel.</em></h1><p>Follow recorded behaviour from product discovery to transaction events.</p></div></div>
+      <div className="section-title"><div><div className="eyebrow">JOURNEY & MOMENTUM</div><h1>Trends <em>& funnel.</em></h1><p>Follow recorded behaviour from product discovery to transaction events, and understand when activity occurs.</p></div></div>
       <div className="metric-grid three">
-        <div className="metric-card"><div className="metric-top"><span>Views</span><Eye size={17}/></div><div className="metric-value">{fmt(metrics.views)}</div><div className="metric-foot">Event volume</div></div>
-        <div className="metric-card"><div className="metric-top"><span>Cart-to-view ratio</span><ShoppingCart size={17}/></div><div className="metric-value">{pct(metrics.cartRate)}</div><div className="metric-foot">Cart events / view events</div></div>
-        <div className="metric-card"><div className="metric-top"><span>Transaction-to-view ratio</span><TrendingUp size={17}/></div><div className="metric-value">{pct(metrics.transactionRate)}</div><div className="metric-foot">Transaction events / view events</div></div>
+        <div className="metric-card"><div className="metric-top"><span>Cart / view event ratio</span><ShoppingCart size={17}/></div><div className="metric-value">{pct(metrics.cartRate)}</div><div className="metric-foot">Cart events / view events</div></div>
+        <div className="metric-card"><div className="metric-top"><span>Transaction / view event ratio</span><TrendingUp size={17}/></div><div className="metric-value">{pct(metrics.transactionRate)}</div><div className="metric-foot">Transaction events / view events</div></div>
+        <div className="metric-card"><div className="metric-top"><span>Transaction / cart event ratio</span><ShoppingBag size={17}/></div><div className="metric-value">{pct(metrics.cartToTransactionRate)}</div><div className="metric-foot">Transaction events / cart events</div></div>
       </div>
-      <section className="panel chart-panel"><div className="panel-heading"><div><div className="eyebrow">EVENT TIMELINE</div><h3>Daily interaction trend</h3><p>Last 30 observed dates with valid timestamps</p></div></div><div className="chart-wrap extra-tall"><ResponsiveContainer width="100%" height="100%"><AreaChart data={metrics.trend}><CartesianGrid stroke="#252c39" vertical={false}/><XAxis dataKey="date" tickFormatter={v=>v.slice(5)} stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><Tooltip contentStyle={{background:"#151a23",border:"1px solid #303849",borderRadius:12}}/><Area dataKey="views" name="Views" stroke="#c8f169" fill="#c8f169" fillOpacity={0.13} strokeWidth={2}/><Area dataKey="carts" name="Cart" stroke="#a995ff" fill="#a995ff" fillOpacity={0.08} strokeWidth={2}/><Area dataKey="transactions" name="Transactions" stroke="#62d5c8" fill="#62d5c8" fillOpacity={0.06} strokeWidth={2}/></AreaChart></ResponsiveContainer></div></section>
-      <section className="panel funnel-panel"><div className="panel-heading"><div><div className="eyebrow">RECORDED EVENT FUNNEL</div><h3>From discovery to transaction</h3><p>Event counts at each stage</p></div></div><div className="funnel-steps">{[{name:"Product views",value:metrics.views,color:"funnel-mint",width:100,desc:"Discovery signals"},{name:"Add to cart",value:metrics.carts,color:"funnel-violet",width:metrics.views?metrics.carts/metrics.views*100:0,desc:"Cart intent signals"},{name:"Transaction events",value:metrics.transactions,color:"funnel-teal",width:metrics.views?metrics.transactions/metrics.views*100:0,desc:"Transaction signals"}].map((s,i)=><div className="funnel-row" key={s.name}><div className="funnel-meta"><b>{s.name}</b><span>{fmt(s.value)} events</span></div><div className="funnel-track"><i className={s.color} style={{width:Math.max(s.width,2)+"%"}}/></div><div className="funnel-desc">{s.desc}</div></div>)}</div><div className="table-note">Stages are event totals and are not necessarily unique users progressing through a session-level funnel.</div></section>
+      <section className="panel chart-panel"><div className="panel-heading"><div><div className="eyebrow">HOURLY EVENT TIMELINE</div><h3>When does customer activity peak?</h3><p>All timestamps displayed in UTC</p></div></div><div className="chart-wrap extra-tall"><ResponsiveContainer width="100%" height="100%"><AreaChart data={metrics.hourly}><CartesianGrid stroke="#252c39" vertical={false}/><XAxis dataKey="hour" tickFormatter={v=>String(v).padStart(2,"0")} stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><Tooltip contentStyle={{background:"#151a23",border:"1px solid #303849",borderRadius:12}}/><Area dataKey="views" name="Views" stroke="#c8f169" fill="#c8f169" fillOpacity={0.13} strokeWidth={2}/><Area dataKey="carts" name="Cart" stroke="#a995ff" fill="#a995ff" fillOpacity={0.08} strokeWidth={2}/><Area dataKey="transactions" name="Transactions" stroke="#62d5c8" fill="#62d5c8" fillOpacity={0.06} strokeWidth={2}/></AreaChart></ResponsiveContainer></div></section>
+      <section className="panel funnel-panel"><div className="panel-heading"><div><div className="eyebrow">RECORDED EVENT FUNNEL</div><h3>Discovery → cart intent → transaction</h3><p>Event counts, not unique visitors passing through each stage</p></div></div><div className="funnel-steps">{[{name:"Product views",value:metrics.views,color:"funnel-mint",width:100,desc:"Discovery signals"},{name:"Add to cart",value:metrics.carts,color:"funnel-violet",width:metrics.views?metrics.carts/metrics.views*100:0,desc:"Cart intent signals"},{name:"Transaction events",value:metrics.transactions,color:"funnel-teal",width:metrics.views?metrics.transactions/metrics.views*100:0,desc:"Transaction signals"}].map((stage,i)=><div className="funnel-row" key={stage.name}><div className="funnel-meta"><b>{stage.name}</b><span>{fmt(stage.value)} events</span></div><div className="funnel-track"><i className={stage.color} style={{width:Math.max(stage.width,2)+"%"}}/></div><div className="funnel-desc">{stage.desc}</div></div>)}</div><div className="table-note">The stages are aggregate event totals and are not necessarily unique users progressing through one session.</div></section>
     </>
   );
 
