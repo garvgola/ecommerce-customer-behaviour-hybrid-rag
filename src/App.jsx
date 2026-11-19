@@ -1059,6 +1059,11 @@ export default function App() {
         <section className="panel"><div className="panel-heading"><div><div className="eyebrow">TOP OF CATALOGUE</div><h3>Products by views</h3><p>Highest recorded product interest</p></div></div><div className="chart-wrap tall"><ResponsiveContainer width="100%" height="100%"><BarChart data={metrics.topProducts.slice(0,7)} layout="vertical" margin={{left:10,right:15}}><CartesianGrid stroke="#252c39" horizontal={false}/><XAxis type="number" stroke="#667085" tickLine={false} axisLine={false} fontSize={10}/><YAxis dataKey="product" type="category" width={95} stroke="#98a2b3" tickLine={false} axisLine={false} fontSize={10}/><Tooltip contentStyle={{background:"#151a23",border:"1px solid #303849",borderRadius:12}}/><Bar dataKey="views" fill="#c8f169" radius={[0,5,5,0]} barSize={18}/></BarChart></ResponsiveContainer></div></section>
         <section className="panel"><div className="panel-heading"><div><div className="eyebrow">CART INTENT</div><h3>Most added to cart</h3><p>Products with highest cart-event volume</p></div></div><div className="rank-list">{metrics.topCart.slice(0,7).map((p,i)=><div className="rank-row" key={p.product}><span className="rank-num">0{i+1}</span><div className="rank-product"><b>{p.product}</b><span>{fmt(p.views)} views</span></div><div className="rank-bar"><i className="violet-bar" style={{width:(metrics.topCart[0]?.carts?p.carts/metrics.topCart[0].carts*100:0)+"%"}}/></div><strong>{fmt(p.carts)}</strong></div>)}</div></section>
       </div>
+      <section className="panel table-panel">
+        <div className="panel-heading"><div><div className="eyebrow">TRANSACTION OUTCOMES</div><h3>Products with the most transaction events</h3><p>Ranked by recorded transaction activity</p></div></div>
+        <div className="table-scroll"><table className="data-table"><thead><tr><th>Product ID</th><th>Views</th><th>Cart events</th><th>Transaction events</th><th>Transaction / view</th></tr></thead><tbody>{metrics.topTransactionProducts.slice(0,10).map(product=><tr key={product.product}><td><b>{product.product}</b></td><td>{fmt(product.views)}</td><td>{fmt(product.carts)}</td><td><span className="value-pill">{fmt(product.transactions)}</span></td><td>{pct(product.views?product.transactions/product.views*100:0)}</td></tr>)}</tbody></table></div>
+        <div className="table-note">Transaction-event / view-event ratios are not unique-customer purchase conversion rates.</div>
+      </section>
       <section className="panel table-panel"><div className="panel-heading"><div><div className="eyebrow">PRODUCT LEDGER</div><h3>Product event breakdown</h3><p>Event counts for the leading products</p></div></div><div className="table-scroll"><table className="data-table"><thead><tr><th>Product ID</th><th>Views</th><th>Add to cart</th><th>Transactions</th><th>Cart / view</th></tr></thead><tbody>{metrics.topProducts.map(p=><tr key={p.product}><td><b>{p.product}</b></td><td>{fmt(p.views)}</td><td>{fmt(p.carts)}</td><td>{fmt(p.transactions)}</td><td>{pct(p.views?p.carts/p.views*100:0)}</td></tr>)}</tbody></table></div><div className="table-note">Event ratios are not unique-customer conversion rates.</div></section>
     </>
   );
@@ -1135,7 +1140,7 @@ export default function App() {
         <div className="page-content">
           {notice&&<div className="notice-toast"><AlertCircle size={15}/>{notice}<button onClick={()=>setNotice("")}><X size={14}/></button></div>}
           {content}
-          <footer className="app-footer"><span>COMMERCE INTELLIGENCE <i>·</i> BUILT FOR SIGNAL-DRIVEN DECISIONS</span><span><span className="live-dot"/> {demoMode?"Synthetic demonstration data":"Browser-loaded dataset"}</span></footer>
+          <footer className="app-footer"><span>COMMERCE INTELLIGENCE <i>·</i> BUILT FOR SIGNAL-DRIVEN DECISIONS</span><span><span className="live-dot"/> {demoMode?"Retailrocket historical reference · 2015":"Browser-loaded dataset"}</span></footer>
         </div>
       </main>
     </div>
