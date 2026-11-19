@@ -449,7 +449,7 @@ function makeRetailrocketMetrics(summary) {
       uniqueTransactionIds: item.unique_transaction_ids
     })),
     trend: [],
-    hourly: summary.hourly_activity,
+    hourly: summary.hourly_activity.map(item => ({ hour: item.hour, views: item.views, carts: item.cart_events, transactions: item.transaction_events })),
     eventMix: [
       { name: "Views", value: event.views, color: COLORS[0] },
       { name: "Add to cart", value: event.cart_events, color: COLORS[1] },
