@@ -280,8 +280,12 @@ function aggregate(data) {
   const hasClickEvent = rows.some(row => row.event === "click");
   const hasImpressionEvent = rows.some(row => row.event === "impression");
   const hasLoginEvent = rows.some(row => row.event === "login");
-  const clicks = hasClickEvent ? eventClicks : rows.reduce((sum, row) => sum + row.clicksValue, 0);
-  const impressions = hasImpressionEvent ? eventImpressions : rows.reduce((sum, row) => sum + row.impressionsValue, 0);
+  const clicks = data.schema.click
+    ? rows.reduce((sum, row) => sum + row.clicksValue, 0)
+    : eventClicks;
+  const impressions = data.schema.impression
+    ? rows.reduce((sum, row) => sum + row.impressionsValue, 0)
+    : eventImpressions;
   const clickAvailable = (hasClickEvent && hasImpressionEvent) || Boolean(data.schema.click && data.schema.impression);
   const loginAvailable = hasLoginEvent || Boolean(data.schema.loginFlag);
   const logins = hasLoginEvent ? counts.login : rows.filter(row => row.isLoggedIn).length;
@@ -299,10 +303,10 @@ function aggregate(data) {
     if (row.event === "view") item.views++;
     if (row.event === "cart") item.carts++;
     if (row.event === "transaction") item.transactions++;
-    if (row.event === "click") item.clicks++;
-    if (row.event === "impression") item.impressions++;
-    if (!hasClickEvent && data.schema.click) item.clicks += row.clicksValue;
-    if (!hasImpressionEvent && data.schema.impression) item.impressions += row.impressionsValue;
+    if (data.schema.click) item.clicks += row.clicksValue;
+    else if (row.event === "click") item.clicks++;
+    if (data.schema.impression) item.impressions += row.impressionsValue;
+    else if (row.event === "impression") item.impressions++;
     productMap.set(row.product, item);
   });
 
@@ -871,7 +875,7 @@ export default function App() {
     <>
       <div className="page-intro journey-hero">
         <div>
-          <div className="eyebrow"><span className="live-dot"/> CUSTOMER JOURNEY INTELLIGENCE / HISTORICAL CASE STUDY</div>
+          <div className="eyebrow"><span className="live-dot"/> CUSTOMER JOURNEY INTELLIGENCE / {demoMode ? "HISTORICAL CASE STUDY" : "UPLOADED DATA ANALYSIS"}</div>
           <h1>From first view<br/><em>to transaction.</em></h1>
           <p>Trace product discovery, cart intent and transaction activity. See where attention turns into action—and where the available event trail stops.</p>
         </div>
@@ -994,15 +998,19 @@ export default function App() {
           <h3>High attention does not always become purchase activity.</h3>
           <div className="spotlight-product">
             <span>HIGHEST VIEW VOLUME</span>
-            <b>Product 187946</b>
-            <div><strong>3,410</strong><small>views</small></div>
-            <p>2 add-to-cart events · 0 transaction events</p>
+            <b>{metrics.topProducts[0]?.product || "No product identifier detected"}</b>
+            <div><strong>{fmt(metrics.topProducts[0]?.views || 0)}</strong><small>views</small></div>
+            <p>{fmt(metrics.topProducts[0]?.carts || 0)} add-to-cart events · {fmt(metrics.topProducts[0]?.transactions || 0)} transaction events</p>
           </div>
           <div className="spotlight-product spotlight-strong">
-            <span>STRONGEST CART + TRANSACTION VOLUME</span>
-            <b>Product 461686</b>
-            <div><strong>306</strong><small>cart events</small><strong>133</strong><small>transaction events</small></div>
-            <p>2,539 views · 12.05% cart/view event ratio</p>
+            <span>HIGHEST TRANSACTION VOLUME</span>
+            {metrics.topTransactionProducts[0] ? (
+              <>
+                <b>{metrics.topTransactionProducts[0].product}</b>
+                <div><strong>{fmt(metrics.topTransactionProducts[0].transactions)}</strong><small>transaction events</small><strong>{fmt(metrics.topTransactionProducts[0].carts)}</strong><small>cart events</small></div>
+                <p>{fmt(metrics.topTransactionProducts[0].views)} views · {pct(metrics.topTransactionProducts[0].views ? metrics.topTransactionProducts[0].transactions / metrics.topTransactionProducts[0].views * 100 : 0)} transaction/view event ratio</p>
+              </>
+            ) : <p>No transaction events were detected in this dataset.</p>}
           </div>
           <div className="spotlight-foot">These are aggregated event records, not linked individual customer paths.</div>
         </section>
@@ -1043,7 +1051,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="notice-box journey-caveat"><AlertCircle size={17}/><div><b>How to interpret this analysis</b><p>The Retailrocket file covers 03 May–18 September 2015 and contains event logs for views, add-to-cart and transactions. Session durations are inferred by grouping each visitor's events with a 30-minute inactivity threshold; they are estimates, not source-provided session records. Event ratios are not unique-customer conversion rates. The file has no impressions, click events, login events, revenue or explicit session IDs.</p></div></div>
+      <div className="notice-box journey-caveat"><AlertCircle size={17}/><div><b>How to interpret this analysis</b><p>{demoMode ? "The Retailrocket file covers 03 May–18 September 2015 and contains event logs for views, add-to-cart and transactions. Session durations are inferred by grouping each visitor's events with a 30-minute inactivity threshold; they are estimates, not source-provided session records. The file has no impressions, click events, login events, revenue or explicit session IDs." : "Metrics are calculated from the currently uploaded file using detected columns and event labels. Check the schema and metric definitions before interpreting them. Session duration may be inferred from a session ID or visitor timestamps; inferred sessions are estimates. Event ratios are not automatically unique-customer conversion rates."}</p></div></div>
     </>
   );
 
